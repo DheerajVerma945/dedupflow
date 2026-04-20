@@ -5,6 +5,7 @@
  *  1. Concurrent calls with the same key share one in-flight promise.
  *  2. Completed results are optionally cached with a TTL expiry.
  *  3. Failed executions are never cached and in-flight entries are cleaned up.
+ *  4. Cache size is optionally bounded; oldest entries are evicted first (FIFO).
  */
 
 // ---------------------------------------------------------------------------
@@ -29,8 +30,18 @@ export interface DedupOptions<TArgs extends unknown[]> {
   /**
    * Derives a string cache key from the function arguments.
    * Defaults to JSON.stringify(args).
+   * NOTE: JSON.stringify is not safe for circular or non-serialisable objects.
+   * Provide a custom key function when working with complex argument types.
    */
   key?: (...args: TArgs) => string;
+
+  /**
+   * Maximum number of entries the cache may hold at one time.
+   * When the limit is reached, the oldest entry is evicted before a new one
+   * is inserted (FIFO eviction).  Works alongside TTL expiry.
+   * Omit for an unbounded cache.
+   */
+  maxSize?: number;
 }
 
 /** Per-call options that can override dedup behaviour for a single invocation. */
@@ -53,8 +64,13 @@ export type DedupFunction<TArgs extends unknown[], TResult> = {
   raw(...args: TArgs): Promise<TResult>;
 
   /**
-   * Call the function but force a fresh execution even if an in-flight
-   * request exists or a cached result is available.
+   * Force a fresh execution even if an in-flight request exists or a cached
+   * result is available.  Evicts the existing entry before executing.
+   */
+  force(...args: TArgs): Promise<TResult>;
+
+  /**
+   * @deprecated Use `force` instead.
    */
   forceCall(...args: TArgs): Promise<TResult>;
 
@@ -79,25 +95,39 @@ interface CacheEntry<T> {
 /**
  * Wraps `fn` with in-flight deduplication and optional TTL caching.
  *
- * @param fn       The async function to wrap.
+ * @param fn       The async (or sync) function to wrap.
  * @param options  Dedup / cache configuration.
  */
 export function createDedup<TArgs extends unknown[], TResult>(
-  fn: (...args: TArgs) => Promise<TResult>,
+  fn: (...args: TArgs) => TResult | Promise<TResult>,
   options?: DedupOptions<TArgs>
 ): DedupFunction<TArgs, TResult> {
 
   const shouldCache = options?.cache !== false; // default: true
   const ttl = options?.ttl;
+  const maxSize = options?.maxSize;
+
+  // Default key uses JSON.stringify with a safe fallback for non-serialisable
+  // arguments.  Provide a custom `key` function for complex or circular objects.
+  const defaultKey = (...args: TArgs): string => {
+    try {
+      return JSON.stringify(args);
+    } catch {
+      throw new TypeError(
+        "dedupflow: Failed to serialize arguments to a cache key. " +
+        "Provide a custom `key` function via the options parameter."
+      );
+    }
+  };
 
   // Derive a string key from the call arguments.
-  const getKey: (...args: TArgs) => string =
-    options?.key ?? ((...args: TArgs) => JSON.stringify(args));
+  const getKey: (...args: TArgs) => string = options?.key ?? defaultKey;
 
   // Map from cache key → in-flight promise (for deduplication).
   const inFlight = new Map<string, Promise<TResult>>();
 
   // Map from cache key → cached result (for TTL cache).
+  // Map insertion order is preserved in JavaScript, enabling FIFO eviction.
   const cache = new Map<string, CacheEntry<TResult>>();
 
   // ---------------------------------------------------------------------------
@@ -105,12 +135,10 @@ export function createDedup<TArgs extends unknown[], TResult>(
   //
   // Run cleanup every `ttl / 2` ms, clamped between MIN_CLEANUP_INTERVAL_MS
   // and MAX_CLEANUP_INTERVAL_MS.  Only scheduled when a TTL is configured AND
-  // caching is enabled.
+  // caching is enabled.  A single interval is created per dedup instance.
   // ---------------------------------------------------------------------------
   const MIN_CLEANUP_INTERVAL_MS = 500;
   const MAX_CLEANUP_INTERVAL_MS = 60_000;
-
-  let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   if (shouldCache && ttl != null) {
     const cleanupInterval = Math.min(
@@ -118,7 +146,7 @@ export function createDedup<TArgs extends unknown[], TResult>(
       MAX_CLEANUP_INTERVAL_MS
     );
 
-    cleanupTimer = setInterval(() => {
+    const cleanupTimer = setInterval(() => {
       const now = Date.now();
       for (const [k, entry] of cache) {
         if (entry.expiresAt !== null && now >= entry.expiresAt) {
@@ -134,7 +162,7 @@ export function createDedup<TArgs extends unknown[], TResult>(
   }
 
   // ---------------------------------------------------------------------------
-  // Core execution — shared by the main callable and forceCall
+  // Core execution — shared by the main callable and force
   // ---------------------------------------------------------------------------
 
   /**
@@ -155,7 +183,7 @@ export function createDedup<TArgs extends unknown[], TResult>(
           if (cached.expiresAt === null || now < cached.expiresAt) {
             return Promise.resolve(cached.value);
           }
-          // Expired — evict immediately.
+          // Expired — evict immediately before proceeding.
           cache.delete(key);
         }
       }
@@ -168,15 +196,21 @@ export function createDedup<TArgs extends unknown[], TResult>(
     }
 
     // 3. No hit — execute the function.
-    const promise = fn(...args)
+    // Wrap in Promise.resolve().then() to safely handle synchronous functions
+    // and synchronous throws as Promise rejections.
+    const promise = (Promise.resolve().then(() => fn(...args)) as Promise<TResult>)
       .then((result) => {
         // Remove from in-flight map as soon as we have a result.
         inFlight.delete(key);
 
         // Store in cache if caching is enabled.
         if (shouldCache) {
-          const expiresAt =
-            ttl != null ? Date.now() + ttl : null;
+          // Enforce maxSize by evicting the oldest entry (FIFO) before inserting.
+          if (maxSize != null && cache.size >= maxSize) {
+            cache.delete(cache.keys().next().value!);
+          }
+
+          const expiresAt = ttl != null ? Date.now() + ttl : null;
           cache.set(key, { value: result, expiresAt });
         }
 
@@ -205,19 +239,25 @@ export function createDedup<TArgs extends unknown[], TResult>(
     return execute(args, false);
   } as DedupFunction<TArgs, TResult>;
 
-  /** Bypass dedup and cache entirely. */
+  /** Bypass dedup and cache entirely — always calls the original function. */
   dedupFn.raw = function (...args: TArgs): Promise<TResult> {
-    return fn(...args);
+    return Promise.resolve().then(() => fn(...args)) as Promise<TResult>;
   };
 
-  /** Force a fresh execution even if dedup/cache would normally short-circuit. */
-  dedupFn.forceCall = function (...args: TArgs): Promise<TResult> {
+  /**
+   * Force a fresh execution even if dedup/cache would normally short-circuit.
+   * Evicts any existing in-flight or cached entry for this key first.
+   */
+  dedupFn.force = function (...args: TArgs): Promise<TResult> {
     const key = getKey(...args);
     // Evict any stale in-flight or cached entry for this key first.
     inFlight.delete(key);
     cache.delete(key);
     return execute(args, false);
   };
+
+  /** @deprecated Use `force` instead. */
+  dedupFn.forceCall = dedupFn.force;
 
   /** Clear all cached results immediately. */
   dedupFn.clearCache = function (): void {
