@@ -1,0 +1,33 @@
+{
+  "name": "dedupflow",
+  "version": "1.0.0",
+  "description": "Lightweight async execution control: concurrency pool, in-flight deduplication, and TTL caching",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "async",
+    "concurrency",
+    "deduplication",
+    "cache",
+    "ttl",
+    "pool",
+    "queue"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.12.7",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.4.5"
+  }
+}
