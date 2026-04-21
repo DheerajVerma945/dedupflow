@@ -1,14 +1,47 @@
 # dedupflow
 
-A lightweight, production-ready npm library for Node.js that provides async execution control with **no external dependencies**.
+[![npm version](https://img.shields.io/npm/v/dedupflow.svg)](https://www.npmjs.com/package/dedupflow)
+[![license](https://img.shields.io/npm/l/dedupflow.svg)](./LICENSE)
+[![zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](./package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-ready-blue.svg)](https://www.typescriptlang.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D14-339933.svg)](https://nodejs.org/)
 
-## Features
+A lightweight, production-ready async execution control library for Node.js with **zero external dependencies**.
 
-| Feature | Description |
+`dedupflow` gives you three composable primitives that solve the most common async coordination problems without the complexity of a full job-queue framework:
+
+| Primitive | What it solves |
 |---|---|
-| **Concurrency Pool** | Limit how many async tasks run at the same time |
-| **In-flight Deduplication** | Prevent duplicate concurrent executions for the same input |
-| **TTL Cache** | Cache results in memory with automatic expiry and optional size cap |
+| **Concurrency Pool** | Limit how many async tasks run simultaneously, with retries and cancellation |
+| **In-flight Deduplication** | Collapse concurrent calls with the same key into a single execution |
+| **TTL Cache** | Remember results in memory with automatic expiry and optional size cap |
+
+---
+
+## Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [API Reference](#api-reference)
+  - [createPool](#createpool)
+  - [pool.run](#poolrun)
+  - [createDedup](#creatededup)
+  - [Dedup methods](#dedup-methods)
+- [Behaviour In Depth](#behaviour-in-depth)
+  - [Concurrency and fail-fast](#concurrency-and-fail-fast)
+  - [Timeout](#timeout)
+  - [Retries](#retries)
+  - [Abort and cancellation](#abort-and-cancellation)
+  - [Timeout and retry interaction](#timeout-and-retry-interaction)
+  - [In-flight deduplication](#in-flight-deduplication)
+  - [TTL cache](#ttl-cache)
+  - [Cache key generation](#cache-key-generation)
+- [Examples](#examples)
+- [Edge Cases](#edge-cases)
+- [Limitations](#limitations)
+- [Design Principles](#design-principles)
+- [Project Structure](#project-structure)
+- [License](#license)
 
 ---
 
@@ -18,6 +51,10 @@ A lightweight, production-ready npm library for Node.js that provides async exec
 npm install dedupflow
 ```
 
+```bash
+yarn add dedupflow
+```
+
 ---
 
 ## Quick Start
@@ -25,19 +62,19 @@ npm install dedupflow
 ```ts
 import { createPool, createDedup } from 'dedupflow';
 
-const pool = createPool({ limit: 3 });
+// At most 3 concurrent HTTP requests, with retries on failure
+const pool = createPool({ limit: 3, retries: 2, retryDelay: 500 });
 
+// Wrap fetch with deduplication + 5-second TTL cache
 const fetchUser = async (id: number) => {
   const res = await fetch(`/api/users/${id}`);
   return res.json();
 };
-
-// Wrap fetchUser with deduplication + 5-second TTL cache
-const cachedFetch = createDedup(fetchUser, { ttl: 5000 });
+const cachedFetch = createDedup(fetchUser, { ttl: 5_000 });
 
 const results = await pool.run([
   () => cachedFetch(1),
-  () => cachedFetch(1), // deduped — shares the same in-flight request
+  () => cachedFetch(1), // deduplicated — shares the same in-flight request
   () => cachedFetch(2),
 ]);
 // fetchUser is called exactly twice (once per unique id)
@@ -45,29 +82,52 @@ const results = await pool.run([
 
 ---
 
-## API
+## API Reference
 
-### `createPool(options?)`
-
-Creates a concurrency-limited task runner.
+### `createPool`
 
 ```ts
-const pool = createPool({ limit: 3, timeout: 5000 });
+import { createPool } from 'dedupflow';
+
+const pool = createPool(options?: PoolOptions): Pool;
 ```
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `limit` | `number` | `5` | Maximum number of tasks that may run concurrently. Must be ≥ 1. |
-| `timeout` | `number` | `undefined` | Per-task timeout in milliseconds. If a task exceeds this duration it is rejected. Optional — no timeout by default. |
+Creates a reusable concurrency pool. All options are optional.
 
-#### `pool.run(tasks)`
+```ts
+interface PoolOptions {
+  limit?:      number;       // default: 5
+  timeout?:    number;       // default: undefined (no timeout)
+  retries?:    number;       // default: 0
+  retryDelay?: number;       // default: 0
+  signal?:     AbortSignal;  // default: undefined (no cancellation)
+}
+```
 
-Runs an array of task functions with the configured concurrency limit.
+| Option | Type | Default | Constraint | Description |
+|---|---|---|---|---|
+| `limit` | `number` | `5` | `>= 1` | Maximum number of tasks that may run concurrently. |
+| `timeout` | `number` | `undefined` | `> 0` | Per-task timeout in milliseconds. Each **retry attempt** receives its own full timeout window. If a task does not settle in time, it is rejected with `Error: Task[N] timed out after Xms`. |
+| `retries` | `number` | `0` | `>= 0` | How many additional attempts to make if a task fails. A task is only considered permanently failed after all retries are exhausted. |
+| `retryDelay` | `number` | `0` | `>= 0` | Milliseconds to wait between retry attempts. |
+| `signal` | `AbortSignal` | `undefined` | — | An `AbortSignal` that can cancel the entire pool run. See [Abort and cancellation](#abort-and-cancellation). |
 
-- Tasks execute in **FIFO order**.
-- Both sync and async task functions are supported.
-- Returns a `Promise<T[]>` that resolves with results in **input order**.
-- Rejects with the first error encountered (see [Concurrency Behaviour](#concurrency-behaviour)).
+**Throws** `RangeError` if `limit < 1`, `retries < 0`, or `retryDelay < 0`.
+
+---
+
+### `pool.run`
+
+```ts
+pool.run<T>(tasks: Array<() => T | Promise<T>>): Promise<T[]>
+```
+
+Executes an array of task functions under the pool's concurrency limit.
+
+- Tasks are dispatched in **FIFO order**.
+- Both synchronous and asynchronous task functions are accepted; synchronous throws are safely caught and converted to rejections.
+- Returns a `Promise<T[]>` that resolves with results in the **same order as the input array**.
+- Rejects with the **first error** that is not resolved by retries.
 
 ```ts
 const results = await pool.run([
@@ -75,78 +135,78 @@ const results = await pool.run([
   () => fetchUser(2),
   () => fetchUser(3),
 ]);
+// results[0] = user 1, results[1] = user 2, results[2] = user 3
 ```
 
 ---
 
-### `createDedup(fn, options?)`
-
-Wraps an async function with in-flight deduplication and optional TTL caching.
+### `createDedup`
 
 ```ts
-const cachedFetch = createDedup(fetchUser, {
-  ttl: 5000,      // cache results for 5 seconds
-  cache: true,    // enable caching (default)
-  maxSize: 500,   // evict oldest entries when cache exceeds 500 items
-  key: (id) => String(id), // custom cache key (default: JSON.stringify(args))
-});
+import { createDedup } from 'dedupflow';
+
+const dedupedFn = createDedup(fn, options?: DedupOptions): DedupFunction;
+```
+
+Wraps any async (or sync) function with in-flight deduplication and optional TTL caching.
+
+```ts
+interface DedupOptions<TArgs> {
+  ttl?:     number;                     // default: undefined (no expiry)
+  cache?:   boolean;                    // default: true
+  maxSize?: number;                     // default: undefined (unbounded)
+  key?:     (...args: TArgs) => string; // default: JSON.stringify(args)
+}
 ```
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `ttl` | `number` | `undefined` | Time-to-live for cached results in milliseconds. Omit to cache indefinitely. |
-| `cache` | `boolean` | `true` | Whether to cache successful results |
-| `maxSize` | `number` | `undefined` | Maximum number of cache entries. Oldest entries are evicted first (FIFO) when the limit is reached. |
-| `key` | `(...args) => string` | `JSON.stringify(args)` | Derives the cache key from arguments. Provide a custom function for complex or circular objects. |
+| `ttl` | `number` | `undefined` | Time-to-live in milliseconds. Omit to keep entries until `clearCache()` is called. |
+| `cache` | `boolean` | `true` | Whether to cache successful results. Set to `false` to keep in-flight deduplication but skip caching. |
+| `maxSize` | `number` | `undefined` | Maximum number of entries. When the limit is reached, the oldest entry is evicted (FIFO) before a new one is stored. |
+| `key` | `(...args) => string` | `JSON.stringify(args)` | Derives the cache key from call arguments. Provide a custom function for complex, circular, or non-serialisable arguments. |
 
-#### Deduplication behaviour
+---
 
-If the same function is already running with the same key, additional calls **return the same in-flight promise** — the underlying function is not called again.
+### Dedup methods
 
-#### Cache behaviour
-
-After a successful call, the result is stored. Subsequent calls with the same key return the cached value immediately until it expires.
-
-Expired entries are evicted automatically by a background interval (runs every `ttl / 2` ms, clamped between 500 ms and 60 s).
-
-#### Failure handling
-
-Failed executions are **never** cached. The in-flight entry is removed so the next call retries the function.
-
-#### Additional methods
+The wrapped function exposes three additional methods:
 
 ```ts
-// Call the original function directly — bypasses all dedup and cache
-cachedFetch.raw(id);
+// Normal call — applies deduplication and cache
+dedupedFn(...args);
 
-// Force a fresh execution, evicting any existing in-flight or cached entry
-cachedFetch.force(id);
+// Bypass dedup and cache entirely — always calls the original function
+dedupedFn.raw(...args);
 
-// Clear all cached results immediately
-cachedFetch.clearCache();
+// Evict the existing in-flight or cached entry for these args, then execute fresh
+dedupedFn.force(...args);
+
+// Remove all cached entries immediately (does not affect in-flight requests)
+dedupedFn.clearCache();
 ```
 
 ---
 
-## Concurrency Behaviour
+## Behaviour In Depth
 
-`pool.run` executes tasks in **FIFO order** up to the configured `limit`.
+### Concurrency and fail-fast
 
-**On error:**
-- No new tasks are scheduled after the first failure.
-- Tasks that are **already running** are **not cancelled** — they continue to completion.
-- Results from tasks that complete after a failure are discarded.
-- The pool rejects with the **first error** encountered.
-- Subsequent errors from still-running tasks are silently ignored (the Promise is already settled).
+`pool.run` is **fail-fast**: as soon as one task fails (after exhausting all retries), the pool stops scheduling new work.
+
+- Tasks that are **already running** are **not cancelled** — they run to completion.
+- Results from tasks that complete after the pool has already failed are **silently discarded**.
+- The pool rejects with the **first error** encountered; all subsequent errors are ignored.
+- The pool resolves only when **every** task has completed successfully.
 
 ```ts
-const pool = createPool({ limit: 3 });
+const pool = createPool({ limit: 2 });
 
 try {
   await pool.run([
-    () => doWork(1),  // running — result kept if it finishes before failure
-    () => Promise.reject(new Error('boom')), // fails
-    () => doWork(3),  // queued — NOT started after failure
+    () => doWork(1),                         // started — result kept if it finishes before failure
+    () => Promise.reject(new Error('boom')), // fails immediately
+    () => doWork(3),                         // queued — NOT started after failure
   ]);
 } catch (err) {
   console.error(err.message); // "boom"
@@ -155,65 +215,204 @@ try {
 
 ---
 
-## Timeout Behaviour
-
-Set a per-task timeout via `createPool({ timeout: ms })`.
-
-- If a task does not settle within the given time it is rejected with:
-  `Error: Task[N] timed out after 3000ms` (where N is the task's index in the array)
-- The timeout **does not stop the pool** — other tasks continue normally.
-- A timed-out task counts as a failed task (same error propagation rules apply).
-- Timeout is optional. Without it, tasks may run indefinitely.
+### Timeout
 
 ```ts
-const pool = createPool({ limit: 2, timeout: 3000 });
+const pool = createPool({ limit: 2, timeout: 3_000 });
+```
+
+- If a task does not settle within `timeout` ms it is rejected with:
+  `Error: Task[N] timed out after 3000ms`
+- A timed-out task follows the same fail-fast rules as any other failed task.
+- If `retries` is configured, each retry attempt receives its own **independent** full timeout window (see [Timeout and retry interaction](#timeout-and-retry-interaction)).
+- Timeout is optional. Without it, tasks may run indefinitely.
+
+---
+
+### Retries
+
+```ts
+const pool = createPool({ limit: 3, retries: 3, retryDelay: 200 });
+```
+
+- `retries` is the number of **additional** attempts after the initial execution. `retries: 2` means up to **3 total attempts**.
+- Each retry is a **fresh execution** of the task function.
+- `retryDelay` is the wait between the end of a failed attempt and the start of the next.
+- A task is only considered permanently failed once **all retries are exhausted**.
+- If the pool is aborted or fails due to another task while a retry delay is in progress, the retry loop exits immediately — no further attempts are made.
+
+```ts
+let attempts = 0;
+const pool = createPool({ limit: 1, retries: 2, retryDelay: 100 });
 
 await pool.run([
-  () => fastOperation(),   // completes in time
-  () => slowOperation(),   // exceeds 3 s → rejected with timeout error
+  () => {
+    attempts++;
+    if (attempts < 3) throw new Error('not yet');
+    return 'success';
+  },
 ]);
+// attempts === 3 — task succeeded on the 3rd try
 ```
 
 ---
 
-## Cache Behaviour
+### Abort and cancellation
 
-| Scenario | Behaviour |
-|---|---|
-| Within TTL | Cached value returned immediately, function not called |
-| TTL expired | Entry evicted, function called fresh |
-| No TTL set | Entry lives indefinitely (until `clearCache()` or GC) |
-| `cache: false` | No caching; in-flight dedup still applies for concurrent calls |
-| `maxSize` reached | Oldest entry evicted (FIFO) before new entry is stored |
+```ts
+const controller = new AbortController();
+const pool = createPool({ limit: 3, signal: controller.signal });
 
-**Eviction strategy:** FIFO — the entry that was inserted first is removed first when `maxSize` is exceeded. TTL expiry runs independently on a background interval and removes stale entries regardless of `maxSize`.
+// Cancel from anywhere
+controller.abort();
+```
+
+**Before `run()` is called:**
+
+If `signal.aborted` is already `true` when `pool.run()` is invoked, the call rejects immediately:
+
+```ts
+new Error('Pool execution aborted')
+```
+
+No tasks are started.
+
+**During execution:**
+
+When `abort()` is called while tasks are running:
+
+- The pool stops scheduling any new or queued tasks immediately.
+- Tasks that are **already running** are allowed to finish (they cannot be cancelled).
+- Their results are silently discarded.
+- The outer `Promise` rejects immediately with `new Error('Pool execution aborted')`.
+
+**Memory safety:**
+
+The abort event listener is always removed once the pool settles (resolve or reject), preventing memory leaks.
+
+```ts
+const controller = new AbortController();
+const pool = createPool({ limit: 5, signal: controller.signal });
+
+const promise = pool.run(heavyTasks);
+
+setTimeout(() => controller.abort(), 500); // cancel after 500 ms
+
+try {
+  await promise;
+} catch (err) {
+  console.error(err.message); // "Pool execution aborted"
+}
+```
 
 ---
 
-## Key Generation
+### Timeout and retry interaction
 
-By default, arguments are serialised with `JSON.stringify(args)` to produce a cache key.
+Each retry attempt receives a **full, independent timeout window**.
 
-> **Warning:** `JSON.stringify` is not safe for:
-> - Circular object references
-> - Non-serialisable values (`undefined`, `Function`, `Symbol`, `BigInt`)
-> - Large or deeply nested objects (performance)
->
-> For these cases, **always provide a custom `key` function**:
+```
+timeout: 2_000ms   retries: 2
+                                    
+Attempt 1: [ task running ... ] timeout: 2000ms
+           fails at 2000ms
+                                    
+Delay: retryDelay ms
+                                    
+Attempt 2: [ task running ... ] timeout: 2000ms  <-- fresh timer
+           fails at 2000ms
+                                    
+Delay: retryDelay ms
+                                    
+Attempt 3: [ task running ... ] timeout: 2000ms  <-- fresh timer
+           succeeds or gives up
+```
+
+Worst-case total time for one task = `(timeout + retryDelay) * (retries + 1)`.
+
+---
+
+### In-flight deduplication
 
 ```ts
-const deduped = createDedup(fn, {
+const dedupedFetch = createDedup(fetchUser);
+
+// These three calls are made concurrently with the same key
+const [a, b, c] = await Promise.all([
+  dedupedFetch(42),
+  dedupedFetch(42), // same in-flight promise — fetchUser called once
+  dedupedFetch(42), // same in-flight promise — fetchUser called once
+]);
+// a === b === c
+```
+
+- While a call is in flight, any additional call with the same key receives the **same promise**.
+- The underlying function is only called **once per key** per in-flight window.
+- If the call fails, the in-flight entry is removed and the next call retries the function.
+- **Failures are never deduplicated** — a failed call does not short-circuit subsequent attempts.
+
+---
+
+### TTL cache
+
+```ts
+const dedupedFetch = createDedup(fetchUser, { ttl: 5_000 });
+```
+
+| Scenario | Behaviour |
+|---|---|
+| Within TTL | Cached value returned immediately; function not called |
+| TTL expired | Entry evicted; function called fresh |
+| No TTL set | Entry lives until `clearCache()` is called |
+| `cache: false` | No caching; in-flight dedup still applies for concurrent calls |
+| `maxSize` reached | Oldest entry evicted (FIFO) before new entry is stored |
+
+**Background cleanup:**  
+When `ttl` is configured, a background interval evicts stale entries automatically. The interval fires every `ttl / 2` ms, clamped between 500 ms and 60 s. The timer is `unref()`'d so it never prevents the Node.js process from exiting.
+
+**Failure policy:**  
+Failed executions are **never cached**. The in-flight entry is removed so the next call retries the function fresh.
+
+---
+
+### Cache key generation
+
+By default, call arguments are serialised with `JSON.stringify(args)`.
+
+```ts
+dedupedFetch(1, 'admin') // key: '[1,"admin"]'
+```
+
+**`JSON.stringify` is not safe for:**
+
+- Circular object references
+- Non-serialisable values: `undefined`, `Function`, `Symbol`, `BigInt`
+- Very large or deeply nested objects (performance impact)
+
+In any of these cases, provide a `key` function:
+
+```ts
+const search = createDedup(searchFn, {
+  key: (query, page) => `${query}:${page}`,
+});
+
+const userOp = createDedup(updateUser, {
   key: (user) => `user:${user.id}`,
 });
 ```
 
-If `JSON.stringify` throws (e.g. circular reference), dedupflow raises a `TypeError` with a descriptive message pointing to the `key` option.
+If `JSON.stringify` throws (e.g. on a circular reference), dedupflow raises:
+
+```
+TypeError: dedupflow: Failed to serialize arguments to a cache key.
+Provide a custom `key` function via the options parameter.
+```
 
 ---
 
 ## Examples
 
-### Limit concurrency to 2
+### Concurrency pool — basic
 
 ```ts
 import { createPool } from 'dedupflow';
@@ -227,18 +426,69 @@ const tasks = Array.from({ length: 10 }, (_, i) => () =>
 const results = await pool.run(tasks);
 ```
 
-### Deduplicate without caching
+### Concurrency pool — with retries and timeout
+
+```ts
+const pool = createPool({ limit: 3, timeout: 5_000, retries: 2, retryDelay: 500 });
+
+// Each task gets up to 3 attempts (initial + 2 retries),
+// each attempt has a 5 s timeout.
+const results = await pool.run([
+  () => fetchFromUnstableApi(1),
+  () => fetchFromUnstableApi(2),
+]);
+```
+
+### Concurrency pool — with AbortController
+
+```ts
+const controller = new AbortController();
+
+const pool = createPool({ limit: 5, signal: controller.signal });
+
+// Cancel all pending work after 2 seconds
+setTimeout(() => controller.abort(), 2_000);
+
+try {
+  await pool.run(longRunningTasks);
+} catch (err) {
+  // err.message === "Pool execution aborted"
+}
+```
+
+### Deduplication — in-flight only (no caching)
 
 ```ts
 import { createDedup } from 'dedupflow';
 
 const deduped = createDedup(expensiveOp, { cache: false });
 
-// Two concurrent calls → one execution
+// Two concurrent calls with the same argument — one execution
 const [a, b] = await Promise.all([deduped('x'), deduped('x')]);
 ```
 
-### Custom cache key
+### Deduplication — with TTL cache
+
+```ts
+const cachedFetch = createDedup(fetchUser, { ttl: 30_000 });
+
+// First call executes fetchUser
+const user1 = await cachedFetch(42);
+
+// Within 30 s — returns cached result immediately
+const user2 = await cachedFetch(42);
+```
+
+### Deduplication — bounded cache
+
+```ts
+const cachedFetch = createDedup(fetchUser, {
+  ttl: 60_000,
+  maxSize: 500, // evict oldest entries when cache exceeds 500 items
+});
+```
+
+### Deduplication — custom cache key
 
 ```ts
 const cachedSearch = createDedup(searchFn, {
@@ -247,32 +497,18 @@ const cachedSearch = createDedup(searchFn, {
 });
 ```
 
-### Bounded cache (evict oldest when full)
+### Force a fresh execution
 
 ```ts
-const cachedFetch = createDedup(fetchUser, {
-  ttl: 60_000,
-  maxSize: 200, // keep at most 200 users in cache
-});
+// Bypasses in-flight dedup and evicts any cached entry for this key
+await cachedFetch.force(42);
 ```
 
-### Per-task timeout
+### Bypass all dedup and cache logic
 
 ```ts
-const pool = createPool({ limit: 4, timeout: 2000 });
-
-await pool.run(tasks); // any task running > 2 s is rejected
-```
-
-### Sync task functions
-
-```ts
-// Pool accepts both sync and async functions
-const pool = createPool({ limit: 2 });
-const results = await pool.run([
-  () => 1 + 1,          // sync
-  () => fetchData(),     // async
-]);
+// Always calls the original function directly
+await cachedFetch.raw(42);
 ```
 
 ### Error propagation
@@ -284,10 +520,35 @@ try {
   await pool.run([
     () => Promise.resolve('ok'),
     () => Promise.reject(new Error('something failed')),
+    () => Promise.resolve('also ok'),
   ]);
 } catch (err) {
   console.error(err.message); // "something failed"
 }
+```
+
+### Synchronous task functions
+
+```ts
+const pool = createPool({ limit: 2 });
+
+const results = await pool.run([
+  () => 1 + 1,       // synchronous — safely wrapped
+  () => fetchData(), // asynchronous
+]);
+```
+
+### Combining pool + dedup
+
+```ts
+const pool = createPool({ limit: 4, retries: 1 });
+const fetchUser = createDedup(getUserFromDB, { ttl: 10_000 });
+
+// Executes at most 4 requests at once, deduplicates repeated IDs,
+// and retries transient failures once.
+const users = await pool.run(
+  userIds.map(id => () => fetchUser(id))
+);
 ```
 
 ---
@@ -296,19 +557,55 @@ try {
 
 | Situation | Behaviour |
 |---|---|
-| Empty task array | Resolves immediately with `[]` |
-| `limit <= 0` | Throws `RangeError: Pool limit must be at least 1` |
-| Sync task function | Safely wrapped in `Promise.resolve().then()` |
-| Circular argument in default key | Throws `TypeError` with guidance to use custom `key` |
+| Empty task array passed to `pool.run` | Resolves immediately with `[]` |
+| `limit < 1` | Throws `RangeError: Pool limit must be at least 1` |
+| `retries < 0` | Throws `RangeError: Pool retries must be at least 0` |
+| `retryDelay < 0` | Throws `RangeError: Pool retryDelay must be at least 0` |
+| Synchronous task function | Wrapped in `Promise.resolve().then()` — throws are caught and treated as rejections |
+| `signal` already aborted before `run()` | Rejects immediately with `Error: Pool execution aborted` without starting any tasks |
+| Pool fails while a retry delay is in progress | Retry loop exits immediately; no further attempts are made |
+| Circular argument with default key | Throws `TypeError` with guidance to use a custom `key` function |
+| `maxSize: 0` or `maxSize: 1` | Works correctly — oldest entry is evicted before each insert |
 
 ---
 
 ## Limitations
 
-- **In-memory only** — no persistence across process restarts.
-- **Single instance** — cache and deduplication state is not shared across multiple Node.js processes or machines. Not suitable for distributed/multi-instance systems.
-- **No cache warming** — cache is empty on startup; the first call for any key always executes the function.
-- **FIFO pool only** — no priority scheduling.
+The following are **intentional design constraints**, not bugs:
+
+- **In-memory only** — no persistence across process restarts or crashes.
+- **Single-process only** — cache and dedup state is not shared between Node.js worker threads, cluster workers, or separate processes. Do not use as a distributed cache or job queue.
+- **No priority scheduling** — tasks execute in FIFO order only.
+- **No dynamic concurrency** — `limit` is fixed at pool creation time and cannot be changed at runtime.
+- **No result aggregation for partial success** — the pool is all-or-nothing: it either resolves with all results or rejects on the first failure.
+- **Running tasks cannot be cancelled** — `AbortSignal` prevents new tasks from starting and discards results of running tasks, but it cannot interrupt a task mid-execution. Cancellation of the underlying work (e.g. an HTTP request) must be implemented inside the task itself.
+- **No cross-instance deduplication** — each `createDedup` call creates an independent in-flight map and cache. Two separate instances wrapping the same function do not share state.
+
+---
+
+## What Is Not Included (By Design)
+
+The following features are **out of scope** and will not be added:
+
+| Feature | Why excluded |
+|---|---|
+| Persistent job queue | Would require an external dependency or storage layer |
+| Distributed locking | Out of scope for an in-memory library |
+| Priority queue | Adds scheduling complexity; use a dedicated library |
+| Event emitters / observability hooks | Increases API surface; compose with your own wrappers |
+| Execution modes (race, all-settled, etc.) | Use `Promise.race` / `Promise.allSettled` directly |
+| Dynamic concurrency adjustment | Complicates internal scheduling; keep limit static |
+
+---
+
+## Design Principles
+
+- **Zero external dependencies** — pure TypeScript; runs on any Node.js ≥ 14 environment without extra packages.
+- **In-memory only** — no I/O, no persistence, no side effects outside the process.
+- **Fail-safe** — errors propagate correctly and never corrupt internal state.
+- **No memory leaks** — background cleanup intervals are `unref()`'d; in-flight maps and abort listeners are always cleaned up on settle.
+- **Composable** — `createPool` and `createDedup` are independent building blocks that can be combined freely.
+- **Predictable** — behaviour is deterministic and fully synchronous where possible; no hidden retries, background queues, or global state.
 
 ---
 
@@ -316,9 +613,9 @@ try {
 
 ```
 src/
-  pool.ts    # Concurrency pool implementation
-  dedup.ts   # Deduplication engine + TTL cache
-  index.ts   # Public API re-exports
+  index.ts        Public API re-exports
+  pool.ts         Concurrency pool (createPool)
+  dedup.ts        Deduplication engine + TTL cache (createDedup)
 tests/
   pool.test.ts
   dedup.test.ts
@@ -326,15 +623,6 @@ tests/
 
 ---
 
-## Design Principles
-
-- **No external dependencies** — pure Node.js / TypeScript
-- **In-memory only** — no persistence layer
-- **Fail-safe** — errors propagate correctly, never corrupt internal state
-- **No memory leaks** — cleanup intervals are unref'd; in-flight maps are always cleaned up
-
----
-
 ## License
 
-MIT
+[MIT](./LICENSE)
